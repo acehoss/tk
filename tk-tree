@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# tk-plugin: Show parent/child ticket tree with status and priority sorting
+# tk-plugin-version: 1.0.0
+
+set -euo pipefail
+
+if [[ -z "${TICKETS_DIR:-}" ]]; then
+    echo "Error: TICKETS_DIR not set (are you running this via tk?)" >&2
+    exit 1
+fi
+
+if [[ ! -d "$TICKETS_DIR" ]]; then
+    echo "Error: TICKETS_DIR does not exist: $TICKETS_DIR" >&2
+    exit 1
+fi
+
+# Resolve partial ticket ID to full ID
+resolve_id() {
+    local id="$1"
+    local exact="$TICKETS_DIR/${id}.md"
+
+    if [[ -f "$exact" ]]; then
+        basename "$exact" .md
+        return 0
+    fi
+
+    local matches count
+    matches=$(find "$TICKETS_DIR" -maxdepth 1 -name "*${id}*.md" 2>/dev/null | head -2)
+    count=$(printf '%s\n' "$matches" | grep -c . || true)
+
+    if [[ "$count" -eq 1 ]]; then
+        basename "$matches" .md
+        return 0
+    elif [[ "$count" -gt 1 ]]; then
+        echo "Error: ambiguous ID '$id' matches multiple tickets" >&2
+        return 1
+    else
+        echo "Error: ticket '$id' not found" >&2
+        return 1
+    fi
+}
+
+root_id="${1:-}"
+
+if [[ -n "$root_id" ]]; then
+    root_id=$(resolve_id "$root_id") || exit 1
+fi
+
+awk -v root_id="$root_id" '
+BEGIN { FS=": "; in_front=0 }
+FNR==1 {
+    if (prev_file) store()
+    id=""; status=""; title=""; parent=""; deps=""; priority=""; in_front=0
+    prev_file=FILENAME
+}
+/^---$/ { in_front = !in_front; next }
+in_front && /^id:/ { id = $2 }
+in_front && /^status:/ { status = $2 }
+in_front && /^parent:/ { parent = $2 }
+in_front && /^priority:/ { priority = $2 }
+in_front && /^deps:/ {
+    deps = $2
+    gsub(/[\[\] ]/, "", deps)
+}
+!in_front && /^# / && title == "" { title = substr($0, 3) }
+function store() {
+    if (id != "") {
+        statuses[id] = status
+        titles[id] = title
+        parents[id] = parent
+        deps_str[id] = deps
+        priorities[id] = (priority != "") ? priority : 2
+        if (parent != "") {
+            child_count[parent]++
+            children[parent, child_count[parent]] = id
+        }
+    }
+}
+
+END {
+    if (prev_file) store()
+
+    # Determine roots
+    root_count = 0
+    if (root_id != "") {
+        if (!(root_id in statuses)) {
+            print "Error: ticket " root_id " not found" > "/dev/stderr"
+            exit 1
+        }
+        roots[++root_count] = root_id
+    } else {
+        for (id in statuses) {
+            if (parents[id] == "" || !(parents[id] in statuses)) {
+                roots[++root_count] = id
+            }
+        }
+    }
+
+    if (root_count == 0) exit 0
+
+    # Sort roots by status (open first), then priority, then ID
+    for (i = 2; i <= root_count; i++) {
+        tmp = roots[i]
+        j = i - 1
+        while (j >= 1 && cmp(roots[j], tmp) > 0) {
+            roots[j + 1] = roots[j]
+            j--
+        }
+        roots[j + 1] = tmp
+    }
+
+    for (r = 1; r <= root_count; r++) {
+        root = roots[r]
+        if (r > 1) print ""
+        dep_str = deps_str[root]
+        dep_display = (dep_str != "") ? " <- [" dep_str "]" : ""
+        gsub(/,/, ", ", dep_display)
+        print root " [" statuses[root] "] " titles[root] dep_display
+
+        delete stack_id
+        delete stack_prefix
+        delete stack_path
+        delete stack_conn
+        sp = 0
+
+        push_children(root, "", ":" root ":")
+
+        while (sp > 0) {
+            id = stack_id[sp]
+            prefix = stack_prefix[sp]
+            path = stack_path[sp]
+            connector = stack_conn[sp]
+            sp--
+
+            if (!(id in statuses)) continue
+            if (index(path, ":" id ":") > 0) continue
+
+            dep_str = deps_str[id]
+            dep_display = (dep_str != "") ? " <- [" dep_str "]" : ""
+            gsub(/,/, ", ", dep_display)
+            print prefix connector id " [" statuses[id] "] " titles[id] dep_display
+
+            if (connector == "└── ") new_prefix = prefix "    "
+            else new_prefix = prefix "│   "
+
+            push_children(id, new_prefix, path id ":")
+        }
+    }
+}
+
+function is_closed(s) {
+    return (s == "closed") ? 1 : 0
+}
+
+function cmp(a, b,    ca, cb, pa, pb) {
+    ca = is_closed(statuses[a])
+    cb = is_closed(statuses[b])
+    if (ca != cb) return ca - cb
+    pa = (a in priorities) ? priorities[a] : 2
+    pb = (b in priorities) ? priorities[b] : 2
+    if (pa != pb) return pa - pb
+    return (a > b) ? 1 : (a < b ? -1 : 0)
+}
+
+function push_children(parent_id, prefix, path,    i, child, n, arr, tmp, j) {
+    n = 0
+    for (i = 1; i <= child_count[parent_id]; i++) {
+        child = children[parent_id, i]
+        if (child == "") continue
+        if (index(path, ":" child ":") > 0) continue
+        arr[++n] = child
+    }
+    if (n == 0) return
+
+    # Sort by status (open first), then priority, then ID
+    for (i = 2; i <= n; i++) {
+        tmp = arr[i]
+        j = i - 1
+        while (j >= 1 && cmp(arr[j], tmp) > 0) {
+            arr[j + 1] = arr[j]
+            j--
+        }
+        arr[j + 1] = tmp
+    }
+
+    # Push in reverse order for correct print order
+    for (i = n; i >= 1; i--) {
+        child = arr[i]
+        sp++
+        stack_id[sp] = child
+        stack_prefix[sp] = prefix
+        stack_conn[sp] = (i == n) ? "└── " : "├── "
+        stack_path[sp] = path
+    }
+}
+' "$TICKETS_DIR"/*.md 2>/dev/null

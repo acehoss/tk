@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# tk-plugin: Archive closed ticket subtrees
+# tk-plugin-version: 1.0.0
+
+set -euo pipefail
+
+if [[ -z "${TICKETS_DIR:-}" ]]; then
+    echo "Error: TICKETS_DIR not set (are you running this via tk?)" >&2
+    exit 1
+fi
+
+if [[ ! -d "$TICKETS_DIR" ]]; then
+    echo "Error: TICKETS_DIR does not exist: $TICKETS_DIR" >&2
+    exit 1
+fi
+
+dry_run=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run|-n) dry_run=1 ;;
+        *)
+            echo "Usage: tk archive [--dry-run|-n]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# awk: parse all tickets, compute recursive archivability, output "id\ttitle" lines
+archivable=$(awk '
+BEGIN { FS=": "; in_front=0 }
+FNR==1 {
+    if (prev_file) store()
+    id=""; status=""; title=""; parent=""; in_front=0
+    prev_file=FILENAME
+}
+/^---$/ { in_front = !in_front; next }
+in_front && /^id:/ { id = $2 }
+in_front && /^status:/ { status = $2 }
+in_front && /^parent:/ { parent = $2 }
+!in_front && /^# / && title == "" { title = substr($0, 3) }
+function store() {
+    if (id != "") {
+        statuses[id] = status
+        titles[id] = title
+        parents[id] = parent
+        if (parent != "") {
+            child_count[parent]++
+            children[parent, child_count[parent]] = id
+        }
+    }
+}
+
+function is_archivable(id,    i, child) {
+    if (id in cache) return cache[id]
+
+    if (statuses[id] != "closed") {
+        cache[id] = 0
+        return 0
+    }
+
+    if (child_count[id] == 0) {
+        cache[id] = 1
+        return 1
+    }
+
+    for (i = 1; i <= child_count[id]; i++) {
+        child = children[id, i]
+        if (!is_archivable(child)) {
+            cache[id] = 0
+            return 0
+        }
+    }
+
+    cache[id] = 1
+    return 1
+}
+
+END {
+    if (prev_file) store()
+
+    # Pass 1: compute base archivability (closed + all children archivable)
+    for (id in statuses) is_archivable(id)
+
+    # Pass 2: for each parent, check if ALL children are base-archivable
+    for (id in statuses) {
+        p = parents[id]
+        if (p != "" && !cache[id]) {
+            sibling_block[p] = 1
+        }
+    }
+
+    # Pass 3: emit archivable tickets, skipping non-roots whose
+    # sibling group contains an ineligible ticket
+    for (id in statuses) {
+        if (!cache[id]) continue
+        p = parents[id]
+        is_root = (p == "" || !(p in statuses))
+        if (!is_root && sibling_block[p]) continue
+        print id "\t" titles[id]
+    }
+}
+' "$TICKETS_DIR"/*.md 2>/dev/null)
+
+if [[ -z "$archivable" ]]; then
+    exit 0
+fi
+
+count=0
+if [[ "$dry_run" -eq 1 ]]; then
+    while IFS=$'\t' read -r id title; do
+        echo "Would archive $id: $title"
+        (( count++ ))
+    done <<< "$archivable"
+    echo "($count tickets would be archived)"
+else
+    mkdir -p "$TICKETS_DIR/archive"
+    while IFS=$'\t' read -r id title; do
+        mv "$TICKETS_DIR/${id}.md" "$TICKETS_DIR/archive/${id}.md"
+        echo "Archived $id: $title"
+        (( count++ ))
+    done <<< "$archivable"
+    echo "($count tickets archived)"
+fi
