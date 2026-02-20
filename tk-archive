@@ -109,7 +109,7 @@ count=0
 if [[ "$dry_run" -eq 1 ]]; then
     while IFS=$'\t' read -r id title; do
         echo "Would archive $id: $title"
-        (( count++ ))
+        (( ++count ))
     done <<< "$archivable"
     echo "($count tickets would be archived)"
 else
@@ -117,7 +117,7 @@ else
     while IFS=$'\t' read -r id title; do
         mv "$TICKETS_DIR/${id}.md" "$TICKETS_DIR/archive/${id}.md"
         echo "Archived $id: $title"
-        (( count++ ))
+        (( ++count ))
     done <<< "$archivable"
     echo "($count tickets archived)"
 fi

@@ -37,3 +37,11 @@ Or manually copy/symlink the `tk-*` files into any directory on your PATH.
 
 - [tk](https://github.com/wedow/ticket) v0.3.2+ (plugin system support)
 - bash, awk, find (standard unix tools)
+
+## Tests
+
+Run the lightweight extension smoke/regression tests:
+
+```bash
+bash tests/run.sh
+```
